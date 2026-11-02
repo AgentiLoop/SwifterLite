@@ -67,8 +67,10 @@ server.stop()
 `start(_:priority:)` opens the socket and returns. Connections are accepted on a background queue (QoS `.userInteractive` by default), and the server keeps running until you call `stop()` or the `HttpServer` is deallocated, so keep a strong reference to it.
 
 ```bash
-curl http://localhost:8080/api/v3/ping   # pong
+curl -H 'Connection: keep-alive' http://localhost:8080/api/v3/ping   # pong
 ```
+
+> **Note:** Send `Connection: keep-alive`. Without it the server closes the socket right after writing the response, and because sockets use `SO_LINGER` 0 the close is a reset, so the client can lose the body (curl reports error 56). `AVPlayer` sends keep-alive, so StarPlayrX isn't affected.
 
 ## Routing
 
@@ -108,10 +110,10 @@ A variable only matches the **last** segment of a route. Requests that don't mat
 
 ### Listing routes
 
-`server.routes` returns every registered route as a string, with the method as the first segment:
+`server.routes` returns every node in the route tree as a string. The method is **not** included, intermediate segments are listed too, and the order is not fixed:
 
 ```swift
-print(server.routes)   // ["/GET/api/v3/ping", "/POST/api/v3/login", ...]
+print(server.routes.sorted())   // ["/api", "/api/v3", "/api/v3/login", "/api/v3/ping", ...]
 ```
 
 ## Requests
@@ -168,11 +170,165 @@ HttpResponse.notFound(.none)
 
 Every response gets a `Content-Length` header and a `Server: SwifterLite mustang` header. A `Connection: keep-alive` header is added when the client asked for keep-alive.
 
+## More examples
+
+Every example below was compiled and run against the `mustang` branch.
+
+### 1. Start on a free port and read it back
+
+Pass `0` and the system picks a port. `port()` returns it, and `state` tracks the lifecycle.
+
+```swift
+let server = HttpServer()
+try server.start(0)
+let port = try server.port()   // e.g. 50367
+print(server.state)            // running
+server.stop()
+print(server.state)            // stopped
+```
+
+### 2. Choose the accept-queue priority
+
+```swift
+try server.start(8080, priority: .utility)   // default is .userInteractive
+```
+
+### 3. Handle start errors
+
+`start` throws a `SocketError`. Each case carries `errno` as a string.
+
+```swift
+do {
+    try server.start(8080)
+} catch SocketError.bindFailed(let errno) {
+    print("bind failed, errno \(errno)")
+} catch {
+    print("could not start: \(error)")
+}
+```
+
+Because the listening socket sets `SO_REUSEPORT`, starting a second server on a port that's already in use **does not** throw; both sockets end up sharing the port.
+
+### 4. Query parameters
+
+`queryParams` is an array of `(name, value)` tuples, so repeated names are kept.
+
+```swift
+server.get["/api/v3/search"] = { request in
+    let q = request.queryParams.first { $0.0 == "q" }?.1 ?? ""
+    let all = Dictionary(request.queryParams, uniquingKeysWith: { first, _ in first })
+    return .ok(.json(["q": q, "count": all.count]))
+}
+// GET /api/v3/search?q=jazz&q=rock&x=1  ->  {"q":"jazz","count":2}
+```
+
+### 5. Request headers
+
+Header names are lowercased.
+
+```swift
+server.get["/api/v3/agent"] = { request in
+    let agent = request.headers["user-agent"] ?? "unknown"
+    let range = request.headers["range"] ?? "-"
+    return .ok(.ping("\(agent) \(range)"))
+}
+```
+
+### 6. Echo the body with custom headers
+
+```swift
+server.post["/api/v3/echo"] = { request in
+    .ok(.byts(request.body, contentType: request.headers["content-type"]),
+        ["X-Method": request.method, "X-Path": request.path])
+}
+```
+
+### 7. Register or disable a route through the router
+
+`server.get` and `server.post` expose their `HttpRouter`. Setting a route to `nil` makes it return 404, though it stays in `server.routes`.
+
+```swift
+server.get.router.register("GET", path: "/api/v3/direct") { _ in .ok(.ping("direct")) }
+
+server.get["/api/v3/old"] = { _ in .ok(.ping("old")) }
+server.get["/api/v3/old"] = nil   // now 404
+```
+
+### 8. Look up a route without a request
+
+`route(_:path:)` returns the matched path parameters and the handler, or `nil`.
+
+```swift
+if let (params, handler) = server.get.router.route("GET", path: "/api/v3/aac/seg1.aac") {
+    print(params)   // [":aac": "seg1.aac"]
+}
+server.get.router.route("GET", path: "/api/v3/old") == nil   // true after example 7
+```
+
+### 9. Override `dispatch` in a subclass
+
+Subclass `HttpServer` (its `init()` is public; `HttpServerIO`'s isn't) to log requests or answer some paths before the router runs.
+
+```swift
+final class LoggingServer: HttpServer {
+    override func dispatch(_ request: HttpRequest) -> dispatchHttpReq {
+        print(request.method, request.path)
+        if request.path == "/health" {
+            return ([:], { _ in .ok(.ping("ok")) })
+        }
+        return super.dispatch(request)
+    }
+}
+```
+
+### 10. Inspect a response
+
+```swift
+let response = HttpResponse.ok(.data(segment, contentType: "audio/aac"), ["Cache-Control": "no-cache"])
+response.statusCode     // 200
+response.reasonPhrase   // "OK"
+response.headers()      // ["Cache-Control": "no-cache", "Content-Type": "audio/aac", "Server": "SwifterLite mustang"]
+
+HttpResponse.notFound().headers()   // ["Server": "SwifterLite mustang"]
+```
+
+### 11. Version string
+
+```swift
+HttpServer.version   // "mustang"
+```
+
+### 12. Raw sockets
+
+`Socket` can be used on its own. This echoes one line back to a client:
+
+```swift
+let listener = try Socket.tcpSocketForListen(9000)   // backlog defaults to SOMAXCONN
+print(try listener.port())                           // 9000
+
+DispatchQueue.global().async {
+    guard let client = try? listener.acceptClientSocket() else { return }
+    defer { client.close() }
+    let line = (try? client.readLine()) ?? ""        // reads up to \n, drops \r
+    try? client.writeUtf8("echo: \(line)\n")
+}
+```
+
+Other calls: `read()` (one byte), `read(length:)`, `writeData(_:)`, `writeUInt8(_:)`, `Socket(socketFileDescriptor:)` to wrap an existing descriptor, and the class helpers `Socket.setNoSigPipe(_:)` and `Socket.close(_:)`. `ErrNumString.description()` returns the current `errno` as a string.
+
+### Public but not usable from outside the module
+
+- `HttpParser.readHttpRequest(_:)` is public, but `HttpParser` has no public initializer.
+- `HttpRequest` has no public initializer, so you only get one inside a handler or `dispatch`.
+- `HttpServerIODelegate` and `delegate` exist, but SwifterLite never calls `socketConnectionReceived(_:)`.
+- `HttpResponseBodyWriter` is only used internally to write bodies. `SerializationError` isn't thrown anywhere.
+- `request.address` is never set by the parser, so it's always `"127.0.0.1"`.
+
 ## Lower-level API
 
 Most apps only need `HttpServer`, but these are public too:
 
-- **`HttpServerIO`**: the accept loop and connection handling. Subclass it and override `dispatch(_:)` to route requests yourself. `state` (`.starting`, `.running`, `.stopping`, `.stopped`) and `port()` report the server's status.
+- **`HttpServerIO`**: the accept loop and connection handling. Subclass `HttpServer` (not `HttpServerIO`, whose initializer is internal) and override `dispatch(_:)` to route requests yourself. `state` (`.starting`, `.running`, `.stopping`, `.stopped`) and `port()` report the server's status.
 - **`HttpRouter` / `MethodRoute`**: the route tree and the `server.get[...]` / `server.post[...]` subscripts.
 - **`Socket`**: a POSIX TCP socket with `tcpSocketForListen`, `acceptClientSocket`, `read`, `readLine`, `writeUtf8`, `writeData`, `writeUInt8` and `port()`. Sockets set `SO_REUSEADDR`, `SO_REUSEPORT`, `SO_LINGER` (0) and `SO_NOSIGPIPE`. These free the port as soon as a socket closes and stop the app from crashing on a broken pipe when it goes into the background.
 - **`SocketError`**: errors thrown by socket calls. Each case includes `errno` as a string.
